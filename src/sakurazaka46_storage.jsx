@@ -293,10 +293,9 @@ export default function SakurazakaStorage() {
 /* ═══════════════ App本体 ═══════════════ */
 function AppInner({ onSignOut }) {
   const [state, setState] = useState(null);
-  const [tab, setTab] = useState("storage"); // storage|edit|search|wish|favorite|stats
+  const [tab, setTab] = useState("storage"); // storage|edit|search|wish|stats
   const [toast, setToast] = useState("");
   const [shot, setShot] = useState(null);
-  const [openMemberSignal, setOpenMemberSignal] = useState(null);
   const saveTimer = useRef(null);
 
   useEffect(() => { (async () => setState((await loadState()) || DEFAULT_STATE))(); }, []);
@@ -448,8 +447,7 @@ function AppInner({ onSignOut }) {
         {tab === "storage" && (
           <StorageTab allMembers={state.members} allSeries={state.series} get={get}
             memberById={memberById} seriesFor={seriesFor} memberStats={memberStats}
-            onToggleFav={toggleFavorite} openSignal={openMemberSignal}
-            onConsumeSignal={() => setOpenMemberSignal(null)} onShotOpen={setShot} />
+            onToggleFav={toggleFavorite} onShotOpen={setShot} />
         )}
         {tab === "edit" && (
           <EditTab allMembers={state.members} allSeries={state.series} get={get} getMeta={getMeta}
@@ -459,16 +457,12 @@ function AppInner({ onSignOut }) {
         )}
         {tab === "search" && <SearchTab state={state} get={get} getMeta={getMeta} />}
         {tab === "wish" && <WishTab items={wishItems()} setWishMeta={setWishMeta} />}
-        {tab === "favorite" && (
-          <FavoriteTab members={state.members} memberStats={memberStats}
-            onOpen={(mId) => { setTab("storage"); setOpenMemberSignal(mId); }} />
-        )}
         {tab === "stats" && <StatsTab state={state} statsOf={memberStats} get={get} />}
       </main>
 
       <nav style={S.tabbar}>
         {[["storage", "ストレージ", "📦"], ["edit", "編集", "✎"], ["search", "検索", "⌕"],
-          ["wish", "希望", "♡"], ["favorite", "お気に入り", "★"], ["stats", "集計", "◔"]].map(([id, label, icon]) => (
+          ["wish", "希望", "♡"], ["stats", "集計", "◔"]].map(([id, label, icon]) => (
           <button key={id} onClick={() => setTab(id)}
             style={{ ...S.tabBtn, ...(tab === id ? S.tabBtnOn : {}) }}>
             <span style={{ fontSize: 16, lineHeight: 1 }}>{icon}</span><span>{label}</span>
@@ -617,17 +611,26 @@ function SeriesCutTable({ sr, targets, get, readOnly, onTap, favIds }) {
 }
 
 /* ═══════════ ストレージタブ(閲覧専用) ═══════════ */
-function StorageTab({ allMembers, allSeries, get, memberById, seriesFor, memberStats, onToggleFav, openSignal, onConsumeSignal, onShotOpen }) {
+function StorageTab({ allMembers, allSeries, get, memberById, seriesFor, memberStats, onToggleFav, onShotOpen }) {
   const [view, setView] = useState("members");
   const [memberDetail, setMemberDetail] = useState(null);
   const [seriesDetail, setSeriesDetail] = useState(null);
   const [zoom, setZoom] = useState(false);
+  const [f, setF] = useState("現役");
+  const [q, setQ] = useState("");
+  const [sortMode, setSortMode] = useState("fav"); // fav=お気に入り優先(デフォルト) / order=メンバー順
 
-  useEffect(() => {
-    if (openSignal) { setView("members"); setMemberDetail(openSignal); setSeriesDetail(null); onConsumeSignal(); }
-  }, [openSignal]); // eslint-disable-line
-
-  const ownedMembers = sortMembers(allMembers.filter((m) => memberStats(m.id).owned > 0));
+  const ownedMembers = sortMembers(allMembers.filter((m) => {
+    if (memberStats(m.id).owned <= 0) return false;
+    if (q && !m.name.includes(q)) return false;
+    if (f === "全員") return true;
+    if (f === "現役" || f === "卒業生") return m.status === f;
+    if (f === "櫻坂" || f === "欅坂") return (m.groups || []).includes(f);
+    return m.gen === Number(f);
+  }));
+  if (sortMode === "fav") {
+    ownedMembers.sort((a, b) => (b.fav ? 1 : 0) - (a.fav ? 1 : 0));
+  }
   const ownedSeries = allSeries.filter((sr) => seriesTotalHeld(sr, get) > 0);
 
   if (view === "members" && memberDetail) {
@@ -693,6 +696,19 @@ function StorageTab({ allMembers, allSeries, get, memberById, seriesFor, memberS
       </div>
       {view === "members" ? (
         <div>
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="名前で検索"
+            style={{ ...S.input, width: "100%", marginBottom: 10 }} />
+          <div style={{ ...S.chipRow, marginBottom: 8 }}>
+            {[["全員", "全員"], ["現役", "現役"], ["卒業生", "卒業生"], ["櫻坂", "櫻坂"], ["欅坂", "欅坂"],
+              ["1", "一期"], ["2", "二期"], ["3", "三期"], ["4", "四期"]].map(([v, l]) => (
+              <button key={v} onClick={() => setF(v)} style={{ ...S.chip, ...(f === v ? S.chipOn : {}) }}>{l}</button>
+            ))}
+          </div>
+          <div style={{ ...S.segment, maxWidth: 260, marginBottom: 12 }}>
+            {[["fav", "お気に入り優先"], ["order", "メンバー順"]].map(([v, l]) => (
+              <button key={v} onClick={() => setSortMode(v)} style={{ ...S.segBtn, ...(sortMode === v ? S.segBtnOn : {}) }}>{l}</button>
+            ))}
+          </div>
           {ownedMembers.length === 0 && <div style={S.empty}>まだ所持データがありません。編集タブで枚数を登録してください。</div>}
           {ownedMembers.map((m) => {
             const st = memberStats(m.id);
@@ -1179,39 +1195,6 @@ function WishRow({ q, setWishMeta, onRemove }) {
       <button style={{ ...S.priBtn, ...priStyle }}
         onClick={() => setWishMeta(sr.id, m.id, c, v, { priority: nextPriority(priority) })}>{priLabel}</button>
       <button style={S.wishRemove} onClick={onRemove}>✕</button>
-    </div>
-  );
-}
-
-/* ═══════════ お気に入りタブ ═══════════ */
-function FavoriteTab({ members, memberStats, onOpen }) {
-  const favs = sortMembers(members.filter((m) => m.fav));
-  return (
-    <div>
-      {favs.length === 0 && <div style={S.empty}>お気に入りがありません。ストレージのメンバー一覧で★を付けてください。</div>}
-      {favs.map((m) => {
-        const st = memberStats(m.id);
-        return (
-          <button key={m.id} style={{ ...S.memberCard, width: "100%", textAlign: "left", border: "1px solid #F3DCE6" }} onClick={() => onOpen(m.id)}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                <span style={{ color: "#C64B7C" }}>★</span>
-                <span style={{ fontWeight: 700, fontSize: 14 }}>{m.name}</span>
-                <span style={S.badgeGen}>{GEN_LABEL[m.gen]}</span>
-                <span style={m.status === "現役" ? S.badgeActive : S.badgeGrad}>{m.status}</span>
-              </div>
-              {st.total > 0 ? (
-                <div style={S.seriesMeta}>
-                  {st.owned}/{st.total} 所持
-                  {st.comp > 0 && <span style={S.compChip}>コンプ{st.comp}</span>}
-                  {st.semi > 0 && <span style={S.semiChip}>セミ{st.semi}</span>}
-                </div>
-              ) : <div style={S.seriesMeta}>対象シリーズなし</div>}
-            </div>
-            {st.total > 0 && <Ring pct={st.pct} small />}
-          </button>
-        );
-      })}
     </div>
   );
 }
