@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import photosData from "./photos_data.json";
+import { supabase } from "./lib/supabaseClient.js";
+import { storage } from "./lib/storage.js";
 
 /* ═══════════════════════════════════════════════
    櫻坂46storage — 生写真管理 v4
    - ストレージ(閲覧専用) / 編集(下書き→確定) / 検索(MV絞込) / 希望 / お気に入り / 集計(週次グラフ)
    - カット×バリアント(衣装違い)対応
-   - 保存: window.storage(端末に永続)
+   - 保存: Supabase(kv_store) — 共有アカウントでログインした端末間で同期
 ═══════════════════════════════════════════════ */
 
 const ALL_CUTS = ["ヨリ", "チュウ", "ヒキ", "座り"];
@@ -210,7 +212,7 @@ function migrateMembers(members) {
 
 async function loadState() {
   try {
-    const r = await window.storage.get(KEY);
+    const r = await storage.get(KEY);
     if (r && r.value) {
       const p = JSON.parse(r.value);
       if (p && p.members && p.ver === 4) return { ...p, members: migrateMembers(p.members) };
@@ -228,8 +230,68 @@ function compStatus(ownedCuts, totalCuts) {
   return "none";
 }
 
-/* ═══════════════ App ═══════════════ */
+/* ═══════════ ログイン画面 ═══════════ */
+function LoginGate() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setErr("");
+    setBusy(true);
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    setBusy(false);
+    if (error) setErr("メールアドレスまたはパスワードが違います");
+  };
+
+  return (
+    <div style={{ ...S.app, display: "grid", placeItems: "center", minHeight: "60vh" }}>
+      <FontLoad />
+      <form onSubmit={submit} style={{ ...S.formCard, maxWidth: 320, width: "90%" }}>
+        <div style={{ ...S.logoRow, justifyContent: "center", marginBottom: 14 }}>
+          <Petal size={22} />
+          <span style={S.logoText}>櫻坂46<span style={{ color: "#3A2A33" }}>storage</span></span>
+        </div>
+        <label style={S.formLabel}>メールアドレス</label>
+        <input type="email" value={email} onChange={(e) => setEmail(e.target.value)}
+          style={{ ...S.input, width: "100%" }} required autoFocus />
+        <label style={{ ...S.formLabel, marginTop: 10 }}>パスワード</label>
+        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
+          style={{ ...S.input, width: "100%" }} required />
+        {err && <div style={{ color: "#C64B7C", fontSize: 12, marginTop: 8 }}>{err}</div>}
+        <button type="submit" disabled={busy} style={{ ...S.primaryBtn, width: "100%", marginTop: 14 }}>
+          {busy ? "確認中…" : "ログイン"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+/* ═══════════════ 認証ゲート ═══════════════ */
 export default function SakurazakaStorage() {
+  const [session, setSession] = useState(undefined); // undefined=確認中 / null=未ログイン / object=ログイン済
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, sess) => setSession(sess));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  if (session === undefined) {
+    return (
+      <div style={{ ...S.app, display: "grid", placeItems: "center", minHeight: "60vh" }}>
+        <FontLoad /><div style={{ color: "#C64B7C", fontWeight: 700 }}>読み込み中…</div>
+      </div>
+    );
+  }
+  if (!session) return <LoginGate />;
+  return <AppInner onSignOut={() => supabase.auth.signOut()} />;
+}
+
+/* ═══════════════ App本体 ═══════════════ */
+function AppInner({ onSignOut }) {
   const [state, setState] = useState(null);
   const [tab, setTab] = useState("storage"); // storage|edit|search|wish|favorite|stats
   const [toast, setToast] = useState("");
@@ -243,7 +305,7 @@ export default function SakurazakaStorage() {
     if (!state) return;
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
-      try { await window.storage.set(KEY, JSON.stringify(state)); }
+      try { await storage.set(KEY, JSON.stringify(state)); }
       catch (e) { console.error(e); }
     }, 400);
     return () => clearTimeout(saveTimer.current);
@@ -377,6 +439,7 @@ export default function SakurazakaStorage() {
         <div style={S.logoRow}>
           <Petal size={22} />
           <span style={S.logoText}>櫻坂46<span style={{ color: "#3A2A33" }}>storage</span></span>
+          <button onClick={onSignOut} style={S.logoutBtn} title="ログアウト">⏻</button>
         </div>
         <span style={S.logoSub}>生写真コレクション管理（欅坂46対応）</span>
       </header>
@@ -425,7 +488,7 @@ function Cell({ v, onClick, readOnly }) {
   return (
     <button onClick={readOnly ? undefined : onClick}
       style={{ ...S.cell, ...st, position: "relative", cursor: readOnly ? "default" : "pointer" }}>
-      {n === 0 ? "" : n === 1 ? "✓" : `×${n}`}
+      {n === 0 ? "" : n === 1 ? "1" : `×${n}`}
       {d > 0 && <span style={S.dmgBadge}>⚠{d > 1 ? d : ""}</span>}
       {h > 0 && <span style={S.highBadge}>💎{h > 1 ? h : ""}</span>}
     </button>
@@ -1364,13 +1427,20 @@ function SeriesForm({ members, onAdd, initialIds }) {
   const setGroup = (fn) => setIds(new Set(members.filter(fn).map((m) => m.id)));
   const toggle = (id) => setIds((s) => { const ns = new Set(s); ns.has(id) ? ns.delete(id) : ns.add(id); return ns; });
 
+  const memberIdByName = useMemo(() => new Map(members.map((m) => [m.name, m.id])), [members]);
+  // メンバー起点(initialIds)の追加では、そのメンバーが参加していないカタログ項目は出さない
+  const initiatingMember = initialIds && initialIds.length === 1
+    ? members.find((m) => m.id === initialIds[0])
+    : null;
+
   const catalog = useMemo(() => {
-    const list = [...PHOTO_CATALOG].reverse(); // 新しい順
+    let list = [...PHOTO_CATALOG].reverse(); // 新しい順
+    if (initiatingMember) {
+      list = list.filter((it) => it.members.some((mm) => mm.name === initiatingMember.name));
+    }
     if (!catQ.trim()) return list;
     return list.filter((it) => it.name.includes(catQ) || it.date.includes(catQ));
-  }, [catQ]);
-
-  const memberIdByName = useMemo(() => new Map(members.map((m) => [m.name, m.id])), [members]);
+  }, [catQ, initiatingMember]);
 
   const pickCatalog = (item) => {
     setName(item.name);
@@ -1500,7 +1570,7 @@ function Gallery({ m, series, get, getMeta, setCellMeta, showToast }) {
       const loaded = {};
       for (const { k } of cells) {
         try {
-          const r = await window.storage.get(imgKey(k));
+          const r = await storage.get(imgKey(k));
           if (r && r.value) loaded[k] = r.value;
         } catch (e) { /* 画像なし */ }
       }
@@ -1528,7 +1598,7 @@ function Gallery({ m, series, get, getMeta, setCellMeta, showToast }) {
       const dataUrl = cv.toDataURL("image/jpeg", 0.72);
       URL.revokeObjectURL(url);
       try {
-        await window.storage.set(imgKey(k), dataUrl);
+        await storage.set(imgKey(k), dataUrl);
         setImgs((s) => ({ ...s, [k]: dataUrl }));
         showToast("画像を保存しました");
       } catch (err) { showToast("画像の保存に失敗しました"); }
@@ -1537,7 +1607,7 @@ function Gallery({ m, series, get, getMeta, setCellMeta, showToast }) {
   };
 
   const removeImage = async (k) => {
-    try { await window.storage.delete(imgKey(k)); } catch (e) { /* noop */ }
+    try { await storage.delete(imgKey(k)); } catch (e) { /* noop */ }
     setImgs((s) => { const ns = { ...s }; delete ns[k]; return ns; });
   };
 
@@ -1617,6 +1687,7 @@ const S = {
   logoRow: { display: "flex", alignItems: "center", gap: 7 },
   logoText: { fontSize: 20, fontWeight: 900, letterSpacing: "0.02em", color: "#C64B7C" },
   logoSub: { fontSize: 11, color: "#A98795", marginLeft: 29 },
+  logoutBtn: { marginLeft: "auto", border: "none", background: "transparent", color: "#B99AA8", fontSize: 16, padding: 4, cursor: "pointer" },
   main: { padding: "14px 14px 0" },
 
   input: { padding: "10px 12px", borderRadius: 12, border: "1.5px solid #EBCBD9", background: "#fff", fontSize: 14, minWidth: 0 },
