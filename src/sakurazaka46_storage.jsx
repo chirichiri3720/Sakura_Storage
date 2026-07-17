@@ -142,21 +142,25 @@ function memberRows(sr, mId) {
   return list && list.length ? list : [""];
 }
 
-/* 増減/難あり/高めの純粋トグル関数(下書き・確定共通) */
-function bumpHolding(cur, mode) {
-  let { n = 0, d = 0, h = 0 } = cur || {};
-  if (mode === "add") n += 1;
-  else if (mode === "sub") { n = Math.max(0, n - 1); d = Math.min(d, n); h = Math.min(h, n); }
-  else if (mode === "dmg") { if (n > 0) d = d < n ? d + 1 : 0; }
-  else if (mode === "high") { if (n > 0) h = h < n ? h + 1 : 0; }
-  return { n, d, h };
+/* 所持数・難あり・希望の純粋トグル関数(下書き・確定共通)
+   kind: "n+"=所持+1 / "n-"=所持-1 / "d"=難あり(0..n循環) / "wish"=希望(ON/OFF) */
+function bumpHolding(cur, kind) {
+  let { n = 0, d = 0, wish = 0 } = cur || {};
+  if (kind === "n+") n += 1;
+  else if (kind === "n-") { n = Math.max(0, n - 1); d = Math.min(d, n); }
+  else if (kind === "d") { if (n > 0) d = d < n ? d + 1 : 0; }
+  else if (kind === "wish") wish = wish ? 0 : 1;
+  return { n, d, wish };
 }
 
 function patchMeta(cur, patch) {
   const next = { ...(cur || {}), ...patch };
-  if (!next.w && !next.loc && !next.note && !next.priority) return undefined;
+  if (!next.loc && !next.note && !next.priority && !next.high) return undefined;
   return next;
 }
+
+/* シリーズ×メンバー単位の「高め」フラグを meta に保存するための擬似カットキー */
+const HIGH_ROW = "__row__";
 
 function nextPriority(p) {
   if (p === 1) return 2;
@@ -321,29 +325,31 @@ function AppInner({ onSignOut }) {
 
   const memberById = (id) => state.members.find((m) => m.id === id);
   const seriesFor = (mId) => state.series.filter((sr) => sr.targetIds.includes(mId));
-  const get = (s, m, c, v = "") => state.holdings[hkey(s, m, c, v)] || { n: 0, d: 0, h: 0 };
+  const get = (s, m, c, v = "") => state.holdings[hkey(s, m, c, v)] || { n: 0, d: 0, wish: 0 };
   const getMeta = (s, m, c, v = "") => state.meta[hkey(s, m, c, v)] || {};
+  const isHigh = (sId, mId) => !!getMeta(sId, mId, HIGH_ROW, "").high;
 
   /* メンバー集計(コンプ/セミ含む・バリアント対応) */
   const memberStats = (mId) => {
     const srs = seriesFor(mId);
-    let total = 0, owned = 0, dub = 0, dmg = 0, high = 0, comp = 0, semi = 0;
+    let total = 0, owned = 0, dub = 0, dmg = 0, wish = 0, comp = 0, semi = 0, high = 0;
     srs.forEach((sr) => {
       const cuts = sr.cuts || ALL_CUTS;
       memberRows(sr, mId).forEach((v) => {
         total += cuts.length;
         let oc = 0;
         cuts.forEach((c) => {
-          const { n, d, h } = get(sr.id, mId, c, v);
+          const { n, d, wish: w } = get(sr.id, mId, c, v);
           if (n >= 1) { owned++; oc++; }
           if (n >= 2) dub += n - 1;
-          dmg += d; high += h;
+          dmg += d; wish += w ? 1 : 0;
         });
         const cs = compStatus(oc, cuts.length);
         if (cs === "comp") comp++; else if (cs === "semi") semi++;
+        if (isHigh(sr.id, mId)) high++;
       });
     });
-    return { total, owned, dub, dmg, high, comp, semi, nSeries: srs.length, pct: total ? Math.round((owned / total) * 100) : 0 };
+    return { total, owned, dub, dmg, wish, high, comp, semi, nSeries: srs.length, pct: total ? Math.round((owned / total) * 100) : 0 };
   };
 
   const toggleFavorite = (mId) => update((st) => {
@@ -375,7 +381,7 @@ function AppInner({ onSignOut }) {
   const commitDraft = (patchHoldings, patchMeta) => {
     update((st) => {
       Object.entries(patchHoldings || {}).forEach(([k, v]) => {
-        if (!v || v.n === 0) delete st.holdings[k]; else st.holdings[k] = v;
+        if (!v || (v.n === 0 && v.d === 0 && !v.wish)) delete st.holdings[k]; else st.holdings[k] = v;
       });
       Object.entries(patchMeta || {}).forEach(([k, v]) => {
         if (!v) delete st.meta[k]; else st.meta[k] = v;
@@ -386,7 +392,7 @@ function AppInner({ onSignOut }) {
     });
   };
 
-  /* 希望タブ用の即時メタ更新(優先度・メモ・削除) */
+  /* 希望タブ用: 優先度・メモの即時更新 */
   const setWishMeta = (sId, mId, cut, variant, patch) => update((st) => {
     const k = hkey(sId, mId, cut, variant);
     const next = patchMeta(st.meta[k], patch);
@@ -394,15 +400,26 @@ function AppInner({ onSignOut }) {
     return st;
   });
 
+  /* 希望タブ用: 希望フラグの解除(holdings.wishを下げ、優先度・メモも消す) */
+  const removeWish = (sId, mId, cut, variant) => update((st) => {
+    const k = hkey(sId, mId, cut, variant);
+    const cur = st.holdings[k];
+    if (cur) {
+      const next = { ...cur, wish: 0 };
+      if (next.n === 0 && next.d === 0) delete st.holdings[k]; else st.holdings[k] = next;
+    }
+    delete st.meta[k];
+    return st;
+  });
+
   const wishItems = () => {
     const out = [];
-    Object.entries(state.meta).forEach(([k, meta]) => {
-      if (!meta || !meta.w) return;
+    Object.entries(state.holdings).forEach(([k, hv]) => {
+      if (!hv || !hv.wish) return;
       const [sId, mId, c, v] = k.split("|");
       const sr = state.series.find((s) => s.id === sId); if (!sr) return;
       const m = memberById(mId); if (!m) return;
-      const { n } = get(sId, mId, c, v);
-      if (n > 0) return;
+      const meta = state.meta[k] || {};
       out.push({ sr, m, c, v, priority: meta.priority, note: meta.note || "" });
     });
     out.sort((a, b) => (a.priority || 9) - (b.priority || 9));
@@ -423,7 +440,7 @@ function AppInner({ onSignOut }) {
             <span style={S.badgeGen}>{GEN_LABEL[m.gen]}</span>
             <span style={m.status === "現役" ? S.badgeActive : S.badgeGrad}>{m.status}</span>
           </div>
-          <MemberCutTable m={m} seriesList={srs} get={get} readOnly onTap={undefined} />
+          <MemberCutTable m={m} seriesList={srs} get={get} getMeta={getMeta} readOnly />
           <div style={S.shotFoot}>櫻坂46storage</div>
         </div>
         <div style={S.shotHint}>この画面をスクリーンショット → タップで戻る</div>
@@ -445,7 +462,7 @@ function AppInner({ onSignOut }) {
 
       <main style={S.main}>
         {tab === "storage" && (
-          <StorageTab allMembers={state.members} allSeries={state.series} get={get}
+          <StorageTab allMembers={state.members} allSeries={state.series} get={get} getMeta={getMeta}
             memberById={memberById} seriesFor={seriesFor} memberStats={memberStats}
             onToggleFav={toggleFavorite} onShotOpen={setShot} />
         )}
@@ -456,7 +473,7 @@ function AppInner({ onSignOut }) {
             deleteSeries={deleteSeries} showToast={showToast} />
         )}
         {tab === "search" && <SearchTab state={state} get={get} getMeta={getMeta} />}
-        {tab === "wish" && <WishTab items={wishItems()} setWishMeta={setWishMeta} />}
+        {tab === "wish" && <WishTab items={wishItems()} setWishMeta={setWishMeta} removeWish={removeWish} />}
         {tab === "stats" && <StatsTab state={state} statsOf={memberStats} get={get} />}
       </main>
 
@@ -476,16 +493,31 @@ function AppInner({ onSignOut }) {
 }
 
 /* ═══════════ セル ═══════════ */
-function Cell({ v, onClick, readOnly }) {
-  const { n, d, h } = v;
-  const st = n === 0 ? S.cellZero : n === 1 ? S.cellOne : S.cellDub;
+/* ストレージ(読み取り専用)のカット表示: 「1」「難あり1」のように文字で並べる */
+function ReadCut({ v }) {
+  const { n, d } = v;
   return (
-    <button onClick={readOnly ? undefined : onClick}
-      style={{ ...S.cell, ...st, position: "relative", cursor: readOnly ? "default" : "pointer" }}>
-      {n === 0 ? "" : n === 1 ? "1" : `×${n}`}
-      {d > 0 && <span style={S.dmgBadge}>⚠{d > 1 ? d : ""}</span>}
-      {h > 0 && <span style={S.highBadge}>💎{h > 1 ? h : ""}</span>}
-    </button>
+    <div style={S.readCut}>
+      <div style={{ ...S.readCutNum, color: n > 0 ? "#9C3D66" : "#DCC3CF" }}>{n > 0 ? n : "―"}</div>
+      {d > 0 && <div style={S.readCutSub}>難あり{d}</div>}
+    </div>
+  );
+}
+
+/* 編集タブのカット操作: 上段=所持数(−/＋)、下段=難あり循環・希望ON/OFF */
+function EditCut({ v, onBump }) {
+  const { n, d, wish } = v;
+  return (
+    <div style={S.editCut}>
+      <div style={S.editCutRow}>
+        <button style={S.editMiniBtn} onClick={() => onBump("n-")}>−</button>
+        <button style={{ ...S.editCutNum, ...(n > 0 ? S.editCutNumOn : {}) }} onClick={() => onBump("n+")}>{n}</button>
+      </div>
+      <div style={S.editCutRow}>
+        <button style={{ ...S.editMiniBtn, ...(d > 0 ? S.editMiniBtnDmgOn : {}) }} onClick={() => onBump("d")}>⚠{d > 0 ? d : ""}</button>
+        <button style={{ ...S.editMiniBtn, ...(wish ? S.editMiniBtnWishOn : {}) }} onClick={() => onBump("wish")}>♡</button>
+      </div>
+    </div>
   );
 }
 
@@ -500,19 +532,9 @@ function Legend() {
     <div style={S.legend}>
       <span><i style={{ ...S.dot, background: "#fff", border: "1.5px dashed #DDB9C8" }} /> 未所持</span>
       <span><i style={{ ...S.dot, background: "#F7CBDC" }} /> 所持</span>
-      <span><i style={{ ...S.dot, background: "#C64B7C" }} /> 複数所持</span>
       <span>⚠ 難あり</span>
-      <span>💎 高め</span>
-    </div>
-  );
-}
-
-function ModeSwitch({ mode, setMode }) {
-  return (
-    <div style={S.segment}>
-      {[["add", "＋追加"], ["sub", "−減"], ["dmg", "⚠難"], ["high", "💎高"]].map(([v, l]) => (
-        <button key={v} onClick={() => setMode(v)} style={{ ...S.segBtn, ...(mode === v ? S.segBtnOn : {}) }}>{l}</button>
-      ))}
+      <span>♡ 希望</span>
+      <span>★ 高め(シリーズ単位)</span>
     </div>
   );
 }
@@ -551,27 +573,35 @@ function FontLoad() {
 }
 
 /* ═══════════ メンバー軸のカット表(シリーズ横断・読み取り/編集共通) ═══════════ */
-function MemberCutTable({ m, seriesList, get, readOnly, onTap }) {
+function MemberCutTable({ m, seriesList, get, getMeta, readOnly, onBump, onToggleHigh }) {
+  const gridHeadStyle = readOnly ? S.gridHead : S.gridHeadEdit;
+  const gridRowStyle = readOnly ? S.gridRow : S.gridRowEdit;
   return (
     <>
       <Legend />
-      <div style={S.gridHead}>
+      <div style={gridHeadStyle}>
         <div style={{ fontWeight: 700 }}>シリーズ</div>
         {ALL_CUTS.map((c) => <div key={c} style={S.cutHead}>{c}</div>)}
       </div>
       {seriesList.length === 0 && <div style={S.empty}>対象シリーズがありません。</div>}
       {seriesList.map((sr) => {
         const cuts = sr.cuts || ALL_CUTS;
+        const high = getMeta ? !!getMeta(sr.id, m.id, HIGH_ROW, "").high : false;
         return memberRows(sr, m.id).map((v, vi) => {
           const oc = cuts.filter((c) => get(sr.id, m.id, c, v).n >= 1).length;
           return (
-            <div key={sr.id + "|" + v} style={S.gridRow}>
+            <div key={sr.id + "|" + v} style={gridRowStyle}>
               <div style={{ ...S.nameCol, fontSize: 12 }}>
+                {onToggleHigh
+                  ? <button style={{ ...S.highStarBtn, color: high ? "#C64B7C" : "#DCC3CF" }} onClick={() => onToggleHigh(sr.id, m.id)}>★</button>
+                  : high && <span style={{ color: "#C64B7C", marginRight: 2 }}>★</span>}
                 {sr.name}{v && <span style={{ color: "#C7A5B4" }}> ({v})</span>} <CompChip status={compStatus(oc, cuts.length)} />
                 {vi === 0 && <div style={{ fontSize: 10, color: "#B99AA8" }}>{sr.era}{sr.timing ? "・" + sr.timing : ""}</div>}
               </div>
               {ALL_CUTS.map((c) => cuts.includes(c)
-                ? <Cell key={c} v={get(sr.id, m.id, c, v)} readOnly={readOnly} onClick={readOnly ? undefined : () => onTap(sr.id, m.id, c, v)} />
+                ? (readOnly
+                    ? <ReadCut key={c} v={get(sr.id, m.id, c, v)} />
+                    : <EditCut key={c} v={get(sr.id, m.id, c, v)} onBump={(kind) => onBump(sr.id, m.id, c, v, kind)} />)
                 : <div key={c} style={S.cellNone}>—</div>)}
             </div>
           );
@@ -582,27 +612,33 @@ function MemberCutTable({ m, seriesList, get, readOnly, onTap }) {
 }
 
 /* ═══════════ シリーズ軸のカット表(メンバー横断・読み取り/編集共通) ═══════════ */
-function SeriesCutTable({ sr, targets, get, readOnly, onTap, favIds }) {
+function SeriesCutTable({ sr, targets, get, getMeta, readOnly, onBump, onToggleHigh }) {
   const cuts = sr.cuts || ALL_CUTS;
-  const gridCols = { gridTemplateColumns: `1fr ${cuts.map(() => "46px").join(" ")}` };
+  const colW = readOnly ? "46px" : "58px";
+  const gridCols = { gridTemplateColumns: `1fr ${cuts.map(() => colW).join(" ")}` };
+  const gridHeadStyle = readOnly ? S.gridHead : S.gridHeadEdit;
+  const gridRowStyle = readOnly ? S.gridRow : S.gridRowEdit;
   return (
     <>
       <Legend />
-      <div style={{ ...S.gridHead, ...gridCols }}>
+      <div style={{ ...gridHeadStyle, ...gridCols }}>
         <div style={{ fontWeight: 700 }}>メンバー</div>
         {cuts.map((c) => <div key={c} style={S.cutHead}>{c}</div>)}
       </div>
       {targets.map((m) => memberRows(sr, m.id).map((v) => {
         const oc = cuts.filter((c) => get(sr.id, m.id, c, v).n >= 1).length;
+        const high = getMeta ? !!getMeta(sr.id, m.id, HIGH_ROW, "").high : false;
         return (
-          <div key={m.id + "|" + v} style={{ ...S.gridRow, ...gridCols }}>
+          <div key={m.id + "|" + v} style={{ ...gridRowStyle, ...gridCols }}>
             <div style={S.nameCol}>
-              {favIds && favIds.has(m.id) && <span style={{ color: "#C64B7C", marginRight: 3 }}>★</span>}
+              {onToggleHigh
+                ? <button style={{ ...S.highStarBtn, color: high ? "#C64B7C" : "#DCC3CF" }} onClick={() => onToggleHigh(sr.id, m.id)}>★</button>
+                : high && <span style={{ color: "#C64B7C", marginRight: 2 }}>★</span>}
               {m.name}{v && <span style={{ color: "#C7A5B4" }}> ({v})</span>} <CompChip status={compStatus(oc, cuts.length)} />
             </div>
-            {cuts.map((c) => (
-              <Cell key={c} v={get(sr.id, m.id, c, v)} readOnly={readOnly} onClick={readOnly ? undefined : () => onTap(sr.id, m.id, c, v)} />
-            ))}
+            {cuts.map((c) => (readOnly
+              ? <ReadCut key={c} v={get(sr.id, m.id, c, v)} />
+              : <EditCut key={c} v={get(sr.id, m.id, c, v)} onBump={(kind) => onBump(sr.id, m.id, c, v, kind)} />))}
           </div>
         );
       }))}
@@ -611,7 +647,7 @@ function SeriesCutTable({ sr, targets, get, readOnly, onTap, favIds }) {
 }
 
 /* ═══════════ ストレージタブ(閲覧専用) ═══════════ */
-function StorageTab({ allMembers, allSeries, get, memberById, seriesFor, memberStats, onToggleFav, onShotOpen }) {
+function StorageTab({ allMembers, allSeries, get, getMeta, memberById, seriesFor, memberStats, onToggleFav, onShotOpen }) {
   const [view, setView] = useState("members");
   const [memberDetail, setMemberDetail] = useState(null);
   const [seriesDetail, setSeriesDetail] = useState(null);
@@ -655,7 +691,7 @@ function StorageTab({ allMembers, allSeries, get, memberById, seriesFor, memberS
           </div>
           <button style={S.shotBtn} onClick={() => onShotOpen(memberDetail)}>📷</button>
         </div>
-        <MemberCutTable m={m} seriesList={srs} get={get} readOnly onTap={undefined} />
+        <MemberCutTable m={m} seriesList={srs} get={get} getMeta={getMeta} readOnly />
       </div>
     );
   }
@@ -682,7 +718,7 @@ function StorageTab({ allMembers, allSeries, get, memberById, seriesFor, memberS
           {sr.timing && <span>{sr.timing}</span>}
           <span>{targets.length}名×{(sr.cuts || ALL_CUTS).length}カット</span>
         </div>
-        <SeriesCutTable sr={sr} targets={targets} get={get} readOnly onTap={undefined} />
+        <SeriesCutTable sr={sr} targets={targets} get={get} getMeta={getMeta} readOnly />
       </div>
     );
   }
@@ -811,7 +847,7 @@ function EditTab({ allMembers, allSeries, get, getMeta, memberById, seriesFor, m
   if (view === "series" && seriesDetail) {
     const sr = allSeries.find((s) => s.id === seriesDetail);
     return (
-      <EditSeriesDetail sr={sr} allMembers={allMembers} get={get}
+      <EditSeriesDetail sr={sr} allMembers={allMembers} get={get} getMeta={getMeta}
         onCommit={commitDraft} onBack={() => setSeriesDetail(null)}
         onDelete={() => { deleteSeries(sr.id); setSeriesDetail(null); }}
         showToast={showToast}
@@ -918,8 +954,11 @@ function EditMemberDetail({ m, seriesList, get, getMeta, onCommit, onBack, showT
         const k = hkey(sr.id, m.id, c, v);
         h[k] = get(sr.id, m.id, c, v);
         const mm = getMeta(sr.id, m.id, c, v);
-        if (mm && (mm.w || mm.loc || mm.note || mm.priority)) me[k] = mm;
+        if (mm && (mm.loc || mm.note || mm.priority)) me[k] = mm;
       }));
+      const hrk = hkey(sr.id, m.id, HIGH_ROW, "");
+      const hrMeta = getMeta(sr.id, m.id, HIGH_ROW, "");
+      if (hrMeta && hrMeta.high) me[hrk] = hrMeta;
     });
     return { h, me };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -928,14 +967,13 @@ function EditMemberDetail({ m, seriesList, get, getMeta, onCommit, onBack, showT
   const [dH, setDH] = useState(seed.h);
   const [dM, setDM] = useState(seed.me);
   const [dirty, setDirty] = useState(false);
-  const [mode, setMode] = useState("add");
   const [view, setView] = useState("grid");
 
-  const dGet = (s, mm, c, v) => dH[hkey(s, mm, c, v)] || { n: 0, d: 0, h: 0 };
+  const dGet = (s, mm, c, v) => dH[hkey(s, mm, c, v)] || { n: 0, d: 0, wish: 0 };
   const dGetMeta = (s, mm, c, v) => dM[hkey(s, mm, c, v)] || {};
-  const tap = (s, mm, c, v) => {
+  const bump = (s, mm, c, v, kind) => {
     const k = hkey(s, mm, c, v);
-    setDH((prev) => ({ ...prev, [k]: bumpHolding(prev[k], mode) }));
+    setDH((prev) => ({ ...prev, [k]: bumpHolding(prev[k], kind) }));
     setDirty(true);
   };
   const setMeta = (s, mm, c, v, patch) => {
@@ -943,6 +981,11 @@ function EditMemberDetail({ m, seriesList, get, getMeta, onCommit, onBack, showT
     setDM((prev) => ({ ...prev, [k]: patchMeta(prev[k], patch) }));
     setDirty(true);
   };
+  const toggleHigh = (sId, mId) => {
+    const cur = dGetMeta(sId, mId, HIGH_ROW, "");
+    setMeta(sId, mId, HIGH_ROW, "", { high: !cur.high });
+  };
+  const wishBump = (s, mm, c, v) => bump(s, mm, c, v, "wish");
 
   const confirm = () => { onCommit(dH, dM); setDirty(false); showToast("確定しました"); };
   const back = () => { if (dirty) showToast("変更を破棄しました"); onBack(); };
@@ -960,35 +1003,45 @@ function EditMemberDetail({ m, seriesList, get, getMeta, onCommit, onBack, showT
             <button key={v} onClick={() => setView(v)} style={{ ...S.segBtn, ...(view === v ? S.segBtnOn : {}) }}>{l}</button>
           ))}
         </div>
-        {view === "grid" && <ModeSwitch mode={mode} setMode={setMode} />}
       </div>
       {view === "grid" ? (
         <>
-          <MemberCutTable m={m} seriesList={seriesList} get={dGet} readOnly={false} onTap={tap} />
+          <MemberCutTable m={m} seriesList={seriesList} get={dGet} getMeta={dGetMeta} readOnly={false} onBump={bump} onToggleHigh={toggleHigh} />
           <button style={S.addRowBtn} onClick={onAddSeries}>＋ シリーズを追加</button>
         </>
       ) : (
-        <Gallery m={m} series={seriesList} get={dGet} getMeta={dGetMeta} setCellMeta={setMeta} showToast={showToast} />
+        <Gallery m={m} series={seriesList} get={dGet} getMeta={dGetMeta} setCellMeta={setMeta} onWishToggle={wishBump} showToast={showToast} />
       )}
     </div>
   );
 }
 
-function EditSeriesDetail({ sr, allMembers, get, onCommit, onBack, onDelete, showToast, onAddMembers }) {
+function EditSeriesDetail({ sr, allMembers, get, getMeta, onCommit, onBack, onDelete, showToast, onAddMembers }) {
   const targets = sortMembers(sr.targetIds.map((id) => allMembers.find((m) => m.id === id)).filter(Boolean));
   const seed = useMemo(() => {
-    const h = {};
+    const h = {}, me = {};
     const cuts = sr.cuts || ALL_CUTS;
-    targets.forEach((m) => memberRows(sr, m.id).forEach((v) => cuts.forEach((c) => { h[hkey(sr.id, m.id, c, v)] = get(sr.id, m.id, c, v); })));
-    return h;
+    targets.forEach((m) => {
+      memberRows(sr, m.id).forEach((v) => cuts.forEach((c) => { h[hkey(sr.id, m.id, c, v)] = get(sr.id, m.id, c, v); }));
+      const hrk = hkey(sr.id, m.id, HIGH_ROW, "");
+      const hrMeta = getMeta(sr.id, m.id, HIGH_ROW, "");
+      if (hrMeta && hrMeta.high) me[hrk] = hrMeta;
+    });
+    return { h, me };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const [dH, setDH] = useState(seed);
+  const [dH, setDH] = useState(seed.h);
+  const [dM, setDM] = useState(seed.me);
   const [dirty, setDirty] = useState(false);
-  const [mode, setMode] = useState("add");
-  const dGet = (s, m, c, v) => dH[hkey(s, m, c, v)] || { n: 0, d: 0, h: 0 };
-  const tap = (s, m, c, v) => { const k = hkey(s, m, c, v); setDH((p) => ({ ...p, [k]: bumpHolding(p[k], mode) })); setDirty(true); };
-  const confirm = () => { onCommit(dH, {}); setDirty(false); showToast("確定しました"); };
+  const dGet = (s, m, c, v) => dH[hkey(s, m, c, v)] || { n: 0, d: 0, wish: 0 };
+  const dGetMeta = (s, m, c, v) => dM[hkey(s, m, c, v)] || {};
+  const bump = (s, m, c, v, kind) => { const k = hkey(s, m, c, v); setDH((p) => ({ ...p, [k]: bumpHolding(p[k], kind) })); setDirty(true); };
+  const toggleHigh = (sId, mId) => {
+    const k = hkey(sId, mId, HIGH_ROW, "");
+    setDM((prev) => ({ ...prev, [k]: patchMeta(prev[k], { high: !dGetMeta(sId, mId, HIGH_ROW, "").high }) }));
+    setDirty(true);
+  };
+  const confirm = () => { onCommit(dH, dM); setDirty(false); showToast("確定しました"); };
   const back = () => { if (dirty) showToast("変更を破棄しました"); onBack(); };
 
   return (
@@ -999,10 +1052,9 @@ function EditSeriesDetail({ sr, allMembers, get, onCommit, onBack, onDelete, sho
         <button style={{ ...S.primaryBtn, opacity: dirty ? 1 : 0.4 }} disabled={!dirty} onClick={confirm}>確定</button>
       </div>
       <div style={S.controlRow}>
-        <ModeSwitch mode={mode} setMode={setMode} />
         <button style={S.trashBtn} onClick={onDelete}>削除</button>
       </div>
-      <SeriesCutTable sr={sr} targets={targets} get={dGet} readOnly={false} onTap={tap} />
+      <SeriesCutTable sr={sr} targets={targets} get={dGet} getMeta={dGetMeta} readOnly={false} onBump={bump} onToggleHigh={toggleHigh} />
       <button style={S.addRowBtn} onClick={onAddMembers}>＋ メンバーを追加</button>
     </div>
   );
@@ -1059,14 +1111,15 @@ function SearchTab({ state, get, getMeta }) {
             if (selCuts.size && !selCuts.has(c)) return;
             const val = get(sr.id, mId, c, v);
             const meta = getMeta(sr.id, mId, c, v);
+            const high = !!getMeta(sr.id, mId, HIGH_ROW, "").high;
             if (selStatus.size) {
               const ok =
                 (selStatus.has("未所持") && val.n === 0) ||
                 (selStatus.has("所持") && val.n >= 1) ||
                 (selStatus.has("複数所持") && val.n >= 2) ||
                 (selStatus.has("難あり") && val.d > 0) ||
-                (selStatus.has("高め") && val.h > 0) ||
-                (selStatus.has("希望♡") && meta.w);
+                (selStatus.has("高め") && high) ||
+                (selStatus.has("希望♡") && val.wish > 0);
               if (!ok) return;
             }
             out.push({ sr, m, c, v, val, meta });
@@ -1139,12 +1192,12 @@ function SearchTab({ state, get, getMeta }) {
         <div key={i} style={S.resultRow}>
           <div style={{ flex: 1, minWidth: 0 }}>
             <span style={{ fontWeight: 700, fontSize: 13 }}>
-              {meta.w && <span style={{ color: "#E0447A" }}>♥ </span>}{m.name}
+              {val.wish > 0 && <span style={{ color: "#E0447A" }}>♥ </span>}{m.name}
             </span>
             <span style={{ fontSize: 11, color: "#A98795", marginLeft: 6 }}>{sr.name} / {c}{v ? `(${v})` : ""}</span>
             {meta.loc && <div style={{ fontSize: 10, color: "#B99AA8" }}>📍{meta.loc}</div>}
           </div>
-          <Cell v={val} readOnly />
+          <ReadCut v={val} />
         </div>
       ))}
       {results.length === 0 && <div style={S.empty}>条件に一致する生写真がありません。</div>}
@@ -1153,17 +1206,17 @@ function SearchTab({ state, get, getMeta }) {
 }
 
 /* ═══════════ 希望タブ(編集・削除のみ) ═══════════ */
-function WishTab({ items, setWishMeta }) {
+function WishTab({ items, setWishMeta, removeWish }) {
   return (
     <div>
       <div style={S.note}>
-        編集タブのギャラリーで♡を付けると、ここに表示されます。優先度とメモの編集、不要になった項目の削除ができます。
+        編集タブのグリッドまたはギャラリーで♡を付けると、ここに表示されます。優先度とメモの編集、不要になった項目の削除ができます。
       </div>
       <div style={S.dashSecTitle}>希望リスト（{items.length}枚）</div>
-      {items.length === 0 && <div style={S.empty}>希望に登録された生写真がありません。編集タブのギャラリーで♡を付けてください。</div>}
+      {items.length === 0 && <div style={S.empty}>希望に登録された生写真がありません。編集タブで♡を付けてください。</div>}
       {items.map((q, i) => (
         <WishRow key={i} q={q} setWishMeta={setWishMeta}
-          onRemove={() => setWishMeta(q.sr.id, q.m.id, q.c, q.v, { w: false, priority: undefined, note: undefined })} />
+          onRemove={() => removeWish(q.sr.id, q.m.id, q.c, q.v)} />
       ))}
     </div>
   );
@@ -1264,11 +1317,8 @@ function Dashboard({ state, statsOf, get }) {
         memberRows(sr, m.id).forEach((v) => cuts.forEach((c) => { sheetsM += get(sr.id, m.id, c, v).n; }));
       });
       sheets += sheetsM; kinds += st.owned; total += st.total;
-      dub += st.dub; dmg += st.dmg; high += st.high; comp += st.comp; semi += st.semi;
+      dub += st.dub; dmg += st.dmg; high += st.high; comp += st.comp; semi += st.semi; wish += st.wish;
       if (st.total > 0) perMember.push({ m, owned: st.owned, total: st.total, sheets: sheetsM, pct: st.pct, comp: st.comp });
-    });
-    Object.entries(state.meta).forEach(([k, v]) => {
-      if (v.w && (state.holdings[k]?.n || 0) === 0) wish++;
     });
     const genAgg = {};
     perMember.forEach(({ m, owned, total }) => {
@@ -1531,7 +1581,7 @@ function SeriesForm({ members, onAdd, initialIds }) {
 }
 
 /* ═══════════ ギャラリー(編集タブ内・下書き対応) ═══════════ */
-function Gallery({ m, series, get, getMeta, setCellMeta, showToast }) {
+function Gallery({ m, series, get, getMeta, setCellMeta, onWishToggle, showToast }) {
   const [imgs, setImgs] = useState({});      // key -> dataURL
   const [editLoc, setEditLoc] = useState(null); // key being edited
   const fileRef = useRef(null);
@@ -1608,7 +1658,7 @@ function Gallery({ m, series, get, getMeta, setCellMeta, showToast }) {
           const meta = getMeta(sr.id, m.id, c, v);
           const img = imgs[k];
           return (
-            <div key={k} style={{ ...S.photoCard, opacity: val.n === 0 && !meta.w ? 0.85 : 1 }}>
+            <div key={k} style={{ ...S.photoCard, opacity: val.n === 0 && !val.wish ? 0.85 : 1 }}>
               <button style={S.photoArea} onClick={() => pickImage(k)}>
                 {img
                   ? <img src={img} alt="" style={S.photoImg} />
@@ -1629,9 +1679,9 @@ function Gallery({ m, series, get, getMeta, setCellMeta, showToast }) {
               <div style={S.photoSeries}>{sr.name}</div>
               <div style={S.photoActions}>
                 <button
-                  onClick={() => setCellMeta(sr.id, m.id, c, v, { w: !meta.w })}
-                  style={{ ...S.heartBtn, color: meta.w ? "#E0447A" : "#DCC3CF" }}>
-                  {meta.w ? "♥ 希望" : "♡ 希望"}
+                  onClick={() => onWishToggle(sr.id, m.id, c, v)}
+                  style={{ ...S.heartBtn, color: val.wish ? "#E0447A" : "#DCC3CF" }}>
+                  {val.wish ? "♥ 希望" : "♡ 希望"}
                 </button>
                 <button onClick={() => setEditLoc(editLoc === k ? null : k)}
                   style={{ ...S.locBtn, color: meta.loc ? "#8A5A6E" : "#C7A5B4" }}>
@@ -1739,16 +1789,27 @@ const S = {
   dot: { display: "inline-block", width: 11, height: 11, borderRadius: 4, marginRight: 4, verticalAlign: -1 },
 
   gridHead: { display: "grid", gridTemplateColumns: "1fr 46px 46px 46px 46px", gap: 5, fontSize: 11, color: "#A9758C", padding: "4px 2px", position: "sticky", top: 64, background: "#FFF6F9", zIndex: 4 },
+  gridHeadEdit: { display: "grid", gridTemplateColumns: "1fr 58px 58px 58px 58px", gap: 5, fontSize: 11, color: "#A9758C", padding: "4px 2px", position: "sticky", top: 64, background: "#FFF6F9", zIndex: 4 },
   cutHead: { textAlign: "center", fontWeight: 700 },
   gridRow: { display: "grid", gridTemplateColumns: "1fr 46px 46px 46px 46px", gap: 5, alignItems: "center", marginBottom: 6 },
-  nameCol: { fontSize: 13, overflow: "hidden", lineHeight: 1.35 },
-  cell: { height: 40, borderRadius: 10, fontSize: 12.5, fontWeight: 800, border: "none" },
-  cellZero: { background: "#fff", border: "1.5px dashed #DDB9C8", color: "transparent" },
-  cellOne: { background: "#F7CBDC", color: "#9C3D66" },
-  cellDub: { background: "#C64B7C", color: "#fff" },
+  gridRowEdit: { display: "grid", gridTemplateColumns: "1fr 58px 58px 58px 58px", gap: 5, alignItems: "center", marginBottom: 8 },
+  nameCol: { fontSize: 13, overflow: "hidden", lineHeight: 1.35, display: "flex", alignItems: "center", gap: 2 },
   cellNone: { height: 40, display: "grid", placeItems: "center", color: "#E5CBD8", fontSize: 12 },
-  dmgBadge: { position: "absolute", top: -5, right: -4, fontSize: 10, background: "#E8A54B", color: "#fff", borderRadius: 999, padding: "0 4px", lineHeight: "14px" },
-  highBadge: { position: "absolute", bottom: -5, right: -4, fontSize: 10, background: "#7B5EA7", color: "#fff", borderRadius: 999, padding: "0 4px", lineHeight: "14px" },
+  highStarBtn: { border: "none", background: "transparent", fontSize: 15, lineHeight: 1, padding: "0 2px 0 0", flexShrink: 0 },
+
+  /* ストレージ(読み取り専用)のカット表示 */
+  readCut: { height: 40, borderRadius: 10, background: "#FBF0F5", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 1 },
+  readCutNum: { fontSize: 13, fontWeight: 800 },
+  readCutSub: { fontSize: 8.5, color: "#E8A54B", fontWeight: 700, lineHeight: 1 },
+
+  /* 編集タブのカット操作(上段=所持数±、下段=難あり循環・希望ON/OFF) */
+  editCut: { display: "flex", flexDirection: "column", gap: 2 },
+  editCutRow: { display: "flex", gap: 2 },
+  editMiniBtn: { flex: 1, height: 18, border: "1px solid #EBCBD9", background: "#fff", color: "#A9758C", borderRadius: 5, fontSize: 10, fontWeight: 800, padding: 0 },
+  editMiniBtnDmgOn: { background: "#E8A54B", borderColor: "#E8A54B", color: "#fff" },
+  editMiniBtnWishOn: { background: "#E0447A", borderColor: "#E0447A", color: "#fff" },
+  editCutNum: { flex: 1.4, height: 22, border: "1.5px solid #EBCBD9", background: "#fff", color: "#C7A5B4", borderRadius: 6, fontSize: 12.5, fontWeight: 800, padding: 0 },
+  editCutNumOn: { background: "#F7CBDC", borderColor: "#F7CBDC", color: "#9C3D66" },
 
   /* ギャラリー(公式サンプル風カード) */
   galleryGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
